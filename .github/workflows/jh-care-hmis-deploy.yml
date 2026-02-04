@@ -1,121 +1,67 @@
-name: Build and deploy CARE FE to GCS for Jharkhand HMIS
+name: Deploy Care Fe
 
 on:
-  push:
-    branches:
-      - develop
   workflow_dispatch:
+  push:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
-  issues: write
-
+  contents: read
+  packages: write  
 jobs:
-  # Step 1: Build the application
   build:
-    runs-on: ubuntu-latest
-    environment: Production
-    outputs:
-      build-artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
+    runs-on: ubuntu-24.04-arm
+    name: Build & Push
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - name: Generate docker tags
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          node-version: 22
-
-      - name: Update .env file
-        run: |
-          echo "${{ vars.DEPLOYMENT_ENV_FILE }}" | base64 --decode > .env
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build the React app
-        run: npm run build
-
-      - name: Upload build artifact
-        id: upload-artifact
-        uses: actions/upload-artifact@v4
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=production-latest,enable=${{ startsWith(github.event.ref, 'refs/tags/v') }}
+            type=raw,value=production-latest-${{ github.run_number }}-{{date 'YYYYMMDD'}}-{{sha}},enable=${{ startsWith(github.event.ref, 'refs/tags/v') }}
+            type=raw,value=staging-latest,enable=${{ github.ref == 'refs/heads/staging' }}
+            type=raw,value=staging-latest-${{ github.run_number }}-{{date 'YYYYMMDD'}}-{{sha}},enable=${{ github.ref == 'refs/heads/staging' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest-${{ github.run_number }},enable=${{ github.ref == 'refs/heads/develop' }}
+            type=semver,pattern={{version}}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          name: build-artifact
-          path: build/
-          retention-days: 1
-
-  # Step 2: Deploy to GCS
-  deploy-to-gcs:
-    runs-on: ubuntu-latest
-    environment: Production
-    needs: build
-    steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Cache Docker layers
+        uses: actions/cache@v4
         with:
-          name: build-artifact
-          path: build/
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('package-lock.json', 'Dockerfile') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+      
+      - name: Build and push
+        uses: docker/build-push-action@v6
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Upload build to GCS
+          context: .
+          file: Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,mode=max,dest=/tmp/.buildx-cache-new
+      
+      - name: Move cache
         run: |
-          gsutil -m rsync -r -d build/ gs://${{ secrets.GCS_BUCKET_NAME }}/
-
-  # Step 3: Invalidate CDN cache
-  invalidate-cdn:
-    runs-on: ubuntu-latest
-    environment: Production
-    needs: deploy-to-gcs
-    steps:
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Invalidate Cloud CDN cache
-        run: |
-          gcloud compute url-maps invalidate-cdn-cache ${{ secrets.CDN_URL_MAP_NAME }} \
-            --path "/*" \
-            --project=${{ secrets.GCP_PROJECT_ID }}
-
-  # Step 4: Notify deployment status
-  notify:
-    runs-on: ubuntu-latest
-    needs: [build, deploy-to-gcs, invalidate-cdn]
-    if: always()
-    steps:
-      - name: Check deployment status
-        run: |
-          if [ "${{ needs.build.result }}" == "success" ] && \
-             [ "${{ needs.deploy-to-gcs.result }}" == "success" ] && \
-             [ "${{ needs.invalidate-cdn.result }}" == "success" ]; then
-            echo "✅ Deployment completed successfully"
-            echo "DEPLOYMENT_STATUS=success" >> $GITHUB_ENV
-          else
-            echo "❌ Deployment failed"
-            echo "DEPLOYMENT_STATUS=failure" >> $GITHUB_ENV
-            exit 1
-          fi
-
-      - name: Create deployment summary
-        run: |
-          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Deploy to GCS | ${{ needs.deploy-to-gcs.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| CDN Invalidation | ${{ needs.invalidate-cdn.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Environment:** Production" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
