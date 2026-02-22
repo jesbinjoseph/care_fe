@@ -17,7 +17,7 @@ RUN npm run postinstall
 
 RUN npm run setup
 
-RUN npm run build
+RUN NODE_ENV='production' npm run build
 
 
 #production-stage
